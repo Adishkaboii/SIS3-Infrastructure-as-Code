@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+.env
+.env.*
+!.env.example
+deployment.env
+.aws/
+*.pem
+*.key
+
+evidence/
+*.backup
+*.log
