@@ -8,43 +8,150 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: sis3-production
+  cancel-in-progress: false
+
 jobs:
   test-and-build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
-      - name: Run tests
+      - name: Run Python tests
         run: python -m unittest discover -s tests -v
 
       - name: Check Python syntax
         run: python -m compileall -q api tests
 
       - name: Build Docker image
-        run: docker build -t sis3-api:${{ github.sha }} ./api
+        run: docker build -t sis3-api:$GITHUB_SHA ./api
 
-  verify-aws-oidc:
+  deploy:
     needs: test-and-build
     runs-on: ubuntu-latest
     environment: production
 
     permissions:
-      id-token: write
       contents: read
+      id-token: write
+
+    env:
+      AWS_DEFAULT_REGION: eu-central-1
+      AWS_PAGER: ""
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: Configure AWS credentials through OIDC
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
           aws-region: eu-central-1
 
-      - name: Verify assumed IAM role
+      - name: Verify AWS identity
         run: aws sts get-caller-identity
+
+      - name: Validate CloudFormation templates
+        run: |
+          for template in templates/*.yaml; do
+            aws cloudformation validate-template \
+              --template-body "file://$template"
+          done
+
+      - name: Deploy shared network
+        run: |
+          aws cloudformation deploy \
+            --stack-name sis3-shared-network \
+            --template-file templates/network.yaml \
+            --no-fail-on-empty-changeset
+
+      - name: Deploy ECR registry
+        run: |
+          aws cloudformation deploy \
+            --stack-name sis3-shared-registry \
+            --template-file templates/registry.yaml \
+            --no-fail-on-empty-changeset
+
+      - name: Build and push immutable image
+        run: |
+          REPO=$(aws cloudformation describe-stacks \
+            --stack-name sis3-shared-registry \
+            --query "Stacks[0].Outputs[?OutputKey=='RepositoryUri'].OutputValue | [0]" \
+            --output text)
+
+          test -n "$REPO"
+          test "$REPO" != "None"
+
+          REGISTRY="${REPO%%/*}"
+
+          aws ecr get-login-password \
+            | docker login --username AWS \
+                --password-stdin "$REGISTRY"
+
+          docker build -t "$REPO:$GITHUB_SHA" ./api
+          docker push "$REPO:$GITHUB_SHA"
+
+          echo "IMAGE_URI=$REPO:$GITHUB_SHA" >> "$GITHUB_ENV"
+
+      - name: Deploy SIS3 ECS stack
+        run: |
+          VPC=$(aws cloudformation describe-stacks \
+            --stack-name sis3-shared-network \
+            --query "Stacks[0].Outputs[?OutputKey=='VpcId'].OutputValue | [0]" \
+            --output text)
+
+          SUBNET_A=$(aws cloudformation describe-stacks \
+            --stack-name sis3-shared-network \
+            --query "Stacks[0].Outputs[?OutputKey=='SubnetA'].OutputValue | [0]" \
+            --output text)
+
+          SUBNET_B=$(aws cloudformation describe-stacks \
+            --stack-name sis3-shared-network \
+            --query "Stacks[0].Outputs[?OutputKey=='SubnetB'].OutputValue | [0]" \
+            --output text)
+
+          aws cloudformation deploy \
+            --stack-name sis3-dev \
+            --template-file templates/application.yaml \
+            --parameter-overrides \
+              Env=dev \
+              VpcId="$VPC" \
+              PublicSubnetA="$SUBNET_A" \
+              PublicSubnetB="$SUBNET_B" \
+              ImageUri="$IMAGE_URI" \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Verify task definition image
+        run: |
+          TASK_ARN=$(aws cloudformation describe-stack-resources \
+            --stack-name sis3-dev \
+            --query "StackResources[?ResourceType=='AWS::ECS::TaskDefinition'].PhysicalResourceId | [0]" \
+            --output text)
+
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_ARN" \
+            --query 'taskDefinition.{Revision:revision,Images:containerDefinitions[].image}' \
+            --output json
+
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_ARN" \
+            --query 'taskDefinition.containerDefinitions[].image' \
+            --output text | grep -F ":$GITHUB_SHA"
+
+      - name: Smoke test
+        run: |
+          HEALTH_URL=$(aws cloudformation describe-stacks \
+            --stack-name sis3-dev \
+            --query "Stacks[0].Outputs[?OutputKey=='HealthUrl'].OutputValue | [0]" \
+            --output text)
+
+          test "$HEALTH_URL" != "None"
+          curl --fail --show-error --retry 12 \
+            --retry-delay 10 --retry-all-errors \
+            --max-time 15 "$HEALTH_URL"
