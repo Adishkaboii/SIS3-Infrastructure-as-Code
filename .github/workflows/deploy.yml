@@ -29,3 +29,22 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t sis3-api:${{ github.sha }} ./api
+
+  verify-aws-oidc:
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    environment: production
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - name: Verify assumed IAM role
+        run: aws sts get-caller-identity
